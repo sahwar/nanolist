@@ -10,7 +10,6 @@ import (
 	"io/ioutil"
 	"log"
 	"net/mail"
-	"net/smtp"
 	"os"
 	"strings"
 	"time"
@@ -42,16 +41,16 @@ func main() {
 		db    *sql.DB
 		debug bool
 		err   error
-		path  *string
+		path  string
 	)
 
 	flag.BoolVar(&debug, "debug", false,
 		"Don't send emails - print them to stdout instead")
-	flag.StringVar(path, "config", "",
+	flag.StringVar(&path, "config", "",
 		"Load configuration from specified file")
 	flag.Parse()
 
-	if cfg, err = config.Load(path); err != nil {
+	if cfg, err = config.Load(&path); err != nil {
 		panic(err)
 	}
 	gConfig = cfg
@@ -365,11 +364,27 @@ func (msg *Message) Send(recipients []string) {
 	}
 	*/
 
-	auth := smtp.PlainAuth("", gConfig.SMTPUsername, gConfig.SMTPPassword, gConfig.SMTPHostname)
-	err := smtp.SendMail(gConfig.SMTPHostname+":"+gConfig.SMTPPort, auth, msg.From, recipients, []byte(msg.String()))
+	client, err := gConfig.OpenSMTP()
 	if err != nil {
-		log.Printf("EROR_SENDING Error=%q\n", err.Error())
-		os.Exit(0)
+		// TODO: handle better
+		panic(err)
+	}
+	defer client.Quit()
+	if err := client.Mail(msg.From); err != nil {
+		panic(err)
+	}
+	for _, rcpt := range recipients {
+		if err := client.Rcpt(rcpt); err != nil {
+			panic(err)
+		}
+	}
+	if wc, err := client.Data(); err != nil {
+		panic(err)
+	} else {
+		defer wc.Close()
+		if _, err := wc.Write([]byte(msg.String())); err != nil {
+			panic(err)
+		}
 	}
 }
 

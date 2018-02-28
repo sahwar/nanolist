@@ -1,6 +1,7 @@
 package config
 
 import (
+	"crypto/tls"
 	"database/sql"
 	"io"
 	"log"
@@ -9,6 +10,7 @@ import (
 	"strings"
 
 	_ "github.com/mattn/go-sqlite3"
+	"github.com/pkg/errors"
 	"gopkg.in/ini.v1"
 )
 
@@ -18,6 +20,8 @@ type Config struct {
 	Database       string `ini:"database"`
 	SMTPHostname   string `ini:"smtp_hostname"`
 	SMTPPort       string `ini:"smtp_port"`
+	SMTPTLS        bool   `ini:"smtp_starttls"`
+	SMTPTLSVerify  bool   `ini:"smtp_tlsverify"`
 	SMTPUsername   string `ini:"smtp_username"`
 	SMTPPassword   string `ini:"smtp_password"`
 	Lists          map[string]*List
@@ -48,33 +52,28 @@ func (config *Config) Check() error {
 		defer log.Close()
 	}
 
-	if client, err := smtp.Dial(
-		config.SMTPHostname + ":" + config.SMTPPort,
-	); err != nil {
+	if client, err := config.OpenSMTP(); err != nil {
 		return err
 	} else {
 		defer client.Close()
-		auth := smtp.PlainAuth("",
-			config.SMTPUsername,
-			config.SMTPPassword,
-			config.SMTPHostname)
-		if err := client.Auth(auth); err != nil {
-			return err
-		}
 	}
 
 	return nil
 }
 
-// Load gConfig from the on-disk config file
+// Load config from an on-disk config file
 func Load(path *string) (*Config, error) {
 	var (
-		err  error
-		file *ini.File
-		cfg  *Config
+		err    error
+		file   *ini.File
+		config *Config
 	)
 
-	if path != nil {
+	config = &Config{
+		SMTPTLSVerify: true,
+	}
+
+	if path != nil && *path != "" {
 		file, err = ini.Load(path)
 	} else {
 		file, err = ini.LooseLoad(
@@ -85,16 +84,16 @@ func Load(path *string) (*Config, error) {
 	}
 
 	if err != nil {
+		return nil, errors.Wrap(err, "Could not open config file for reading")
+	}
+
+	config = &Config{}
+
+	if err = file.Section("").MapTo(config); err != nil {
 		return nil, err
 	}
 
-	cfg = &Config{}
-
-	if err = file.Section("").MapTo(cfg); err != nil {
-		return nil, err
-	}
-
-	cfg.Lists = make(map[string]*List)
+	config.Lists = make(map[string]*List)
 
 	for _, section := range file.ChildSections("list") {
 		list := &List{}
@@ -103,28 +102,28 @@ func Load(path *string) (*Config, error) {
 			return nil, err
 		}
 		list.Id = strings.TrimPrefix(section.Name(), "list.")
-		cfg.Lists[list.Address] = list
+		config.Lists[list.Address] = list
 	}
 
-	return cfg, nil
+	return config, nil
 }
 
-func (cfg *Config) OpenLog() (io.Closer, error) {
+func (config *Config) OpenLog() (io.Closer, error) {
 	file, err := os.OpenFile(
-		cfg.Log, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0644)
+		config.Log, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0644)
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrap(err, "could not open log")
 	}
 	out := io.MultiWriter(file, os.Stderr)
 	log.SetOutput(out)
 	return file, nil
 }
 
-func (cfg *Config) OpenDB() (*sql.DB, error) {
-	db, err := sql.Open("sqlite3", cfg.Database)
+func (config *Config) OpenDB() (*sql.DB, error) {
+	db, err := sql.Open("sqlite3", config.Database)
 
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrap(err, "could not open database")
 	}
 
 	_, err = db.Exec(`
@@ -135,4 +134,27 @@ func (cfg *Config) OpenDB() (*sql.DB, error) {
 	`)
 
 	return db, err
+}
+
+func (config *Config) OpenSMTP() (*smtp.Client, error) {
+	client, err := smtp.Dial(config.SMTPHostname + ":" + config.SMTPPort)
+	if err != nil {
+		return nil, errors.Wrap(err, "could not dial SMTP server")
+	}
+	if config.SMTPTLS {
+		var tlsConfig *tls.Config
+		if !config.SMTPTLSVerify {
+			tlsConfig = &tls.Config{InsecureSkipVerify: true}
+		}
+		client.StartTLS(tlsConfig)
+	}
+	auth := smtp.PlainAuth("",
+		config.SMTPUsername,
+		config.SMTPPassword,
+		config.SMTPHostname)
+	if err := client.Auth(auth); err != nil {
+		return nil, errors.Wrap(err,
+			"could not authenticate to SMTP server")
+	}
+	return client, nil
 }
