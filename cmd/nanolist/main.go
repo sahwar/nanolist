@@ -6,8 +6,6 @@ import (
 	"database/sql"
 	"flag"
 	"fmt"
-	_ "github.com/mattn/go-sqlite3"
-	"gopkg.in/ini.v1"
 	"io"
 	"io/ioutil"
 	"log"
@@ -16,31 +14,9 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"github.com/eXeC64/nanolist/config"
 )
-
-type Config struct {
-	CommandAddress string `ini:"command_address"`
-	Log            string `ini:"log"`
-	Database       string `ini:"database"`
-	SMTPHostname   string `ini:"smtp_hostname"`
-	SMTPPort       string `ini:"smtp_port"`
-	SMTPUsername   string `ini:"smtp_username"`
-	SMTPPassword   string `ini:"smtp_password"`
-	Lists          map[string]*List
-	Debug          bool
-	ConfigFile     string
-}
-
-type List struct {
-	Name            string `ini:"name"`
-	Description     string `ini:"description"`
-	Id              string
-	Address         string   `ini:"address"`
-	Hidden          bool     `ini:"hidden"`
-	SubscribersOnly bool     `ini:"subscribers_only"`
-	Posters         []string `ini:"posters,omitempty"`
-	Bcc             []string `ini:"bcc,omitempty"`
-}
 
 type Message struct {
 	Subject     string
@@ -56,33 +32,52 @@ type Message struct {
 	Body        string
 }
 
-var gConfig *Config
+var gConfig *config.Config
+var gDB *sql.DB
 
 // Entry point
 func main() {
-	gConfig = &Config{}
+	var (
+		cfg   *config.Config
+		db    *sql.DB
+		debug bool
+		err   error
+		path  *string
+	)
 
-	flag.BoolVar(&gConfig.Debug, "debug", false, "Don't send emails - print them to stdout instead")
-	flag.StringVar(&gConfig.ConfigFile, "config", "", "Load configuration from specified file")
+	flag.BoolVar(&debug, "debug", false,
+		"Don't send emails - print them to stdout instead")
+	flag.StringVar(path, "config", "",
+		"Load configuration from specified file")
 	flag.Parse()
 
-	loadConfig()
+	if cfg, err = config.Load(path); err != nil {
+		panic(err)
+	}
+	gConfig = cfg
+	if l, err := cfg.OpenLog(); err != nil {
+		panic(err)
+	} else {
+		defer l.Close()
+	}
 
 	if len(flag.Args()) < 1 {
-		fmt.Printf("Error: Command not specified\n")
-		os.Exit(1)
+		panic(fmt.Errorf("Error: Command not specified\n"))
 	}
 
 	if flag.Arg(0) == "check" {
-		if checkConfig() {
+		if err := cfg.Check(); err == nil {
 			fmt.Printf("Congratulations, nanolist appears to be successfully set up!")
 			os.Exit(0)
 		} else {
-			os.Exit(1)
+			panic(err)
 		}
 	}
 
-	requireLog()
+	if db, err = cfg.OpenDB(); err != nil {
+		panic(err)
+	}
+	gDB = db
 
 	if flag.Arg(0) == "message" {
 		msg := &Message{}
@@ -107,9 +102,9 @@ func handleMessage(msg *Message) {
 		lists := lookupLists(msg)
 		if len(lists) > 0 {
 			for _, list := range lists {
-				if list.CanPost(msg.From) {
+				if CanPost(msg.From, list) {
 					listMsg := msg.ResendAs(list.Id, list.Address)
-					list.Send(listMsg)
+					Send(listMsg, list)
 					log.Printf("MESSAGE_SENT ListId=%q Id=%q From=%q To=%q Cc=%q Bcc=%q Subject=%q\n",
 						list.Id, listMsg.Id, listMsg.From, listMsg.To, listMsg.Cc, listMsg.Bcc, listMsg.Subject)
 				} else {
@@ -357,6 +352,7 @@ func (msg *Message) String() string {
 }
 
 func (msg *Message) Send(recipients []string) {
+	/* TODO
 	if gConfig.Debug {
 		fmt.Printf("------------------------------------------------------------\n")
 		fmt.Printf("SENDING MESSAGE TO:\n")
@@ -367,6 +363,7 @@ func (msg *Message) Send(recipients []string) {
 		fmt.Printf("%s\n", msg.String())
 		return
 	}
+	*/
 
 	auth := smtp.PlainAuth("", gConfig.SMTPUsername, gConfig.SMTPPassword, gConfig.SMTPHostname)
 	err := smtp.SendMail(gConfig.SMTPHostname+":"+gConfig.SMTPPort, auth, msg.From, recipients, []byte(msg.String()))
@@ -379,16 +376,16 @@ func (msg *Message) Send(recipients []string) {
 // MAILING LIST LOGIC /////////////////////////////////////////////////////////
 
 // Check if the user is authorised to post to this mailing list
-func (list *List) CanPost(from string) bool {
+func CanPost(from string, to *config.List) bool {
 
 	// Is this list restricted to subscribers only?
-	if list.SubscribersOnly && !isSubscribed(from, list.Id) {
+	if to.SubscribersOnly && !isSubscribed(from, to.Id) {
 		return false
 	}
 
 	// Is there a whitelist of approved posters?
-	if len(list.Posters) > 0 {
-		for _, poster := range list.Posters {
+	if len(to.Posters) > 0 {
+		for _, poster := range to.Posters {
 			if from == poster {
 				return true
 			}
@@ -400,9 +397,9 @@ func (list *List) CanPost(from string) bool {
 }
 
 // Send a message to the mailing list
-func (list *List) Send(msg *Message) {
-	recipients := fetchSubscribers(list.Id)
-	for _, bcc := range list.Bcc {
+func Send(msg *Message, to *config.List) {
+	recipients := fetchSubscribers(to.Id)
+	for _, bcc := range to.Bcc {
 		recipients = append(recipients, bcc)
 	}
 	msg.Send(recipients)
@@ -410,38 +407,9 @@ func (list *List) Send(msg *Message) {
 
 // DATABASE LOGIC /////////////////////////////////////////////////////////////
 
-// Open the database
-func openDB() (*sql.DB, error) {
-	db, err := sql.Open("sqlite3", gConfig.Database)
-
-	if err != nil {
-		return nil, err
-	}
-
-	_, err = db.Exec(`
-	CREATE TABLE IF NOT EXISTS "subscriptions" (
-		"list" TEXT,
-		"user" TEXT
-	);
-	`)
-
-	return db, err
-}
-
-// Open the database or fail immediately
-func requireDB() *sql.DB {
-	db, err := openDB()
-	if err != nil {
-		log.Printf("DATABASE_ERROR Error=%q\n", err.Error())
-		os.Exit(1)
-	}
-	return db
-}
-
 // Fetch list of subscribers to a mailing list from database
 func fetchSubscribers(listId string) []string {
-	db := requireDB()
-	rows, err := db.Query("SELECT user FROM subscriptions WHERE list=?", listId)
+	rows, err := gDB.Query("SELECT user FROM subscriptions WHERE list=?", listId)
 
 	if err != nil {
 		log.Printf("DATABASE_ERROR Error=%q\n", err.Error())
@@ -466,10 +434,8 @@ func isSubscribed(user string, list string) bool {
 		log.Printf("DATABASE_ERROR Error=%q\n", err.Error())
 		os.Exit(0)
 	}
-	db := requireDB()
-
 	exists := false
-	err = db.QueryRow("SELECT 1 FROM subscriptions WHERE user=? AND list=?", addressObj.Address, list).Scan(&exists)
+	err = gDB.QueryRow("SELECT 1 FROM subscriptions WHERE user=? AND list=?", addressObj.Address, list).Scan(&exists)
 
 	if err == sql.ErrNoRows {
 		return false
@@ -489,8 +455,7 @@ func addSubscription(user string, list string) {
 		os.Exit(0)
 	}
 
-	db := requireDB()
-	_, err = db.Exec("INSERT INTO subscriptions (user,list) VALUES(?,?)", addressObj.Address, list)
+	_, err = gDB.Exec("INSERT INTO subscriptions (user,list) VALUES(?,?)", addressObj.Address, list)
 	if err != nil {
 		log.Printf("DATABASE_ERROR Error=%q\n", err.Error())
 		os.Exit(0)
@@ -506,8 +471,7 @@ func removeSubscription(user string, list string) {
 		os.Exit(0)
 	}
 
-	db := requireDB()
-	_, err = db.Exec("DELETE FROM subscriptions WHERE user=? AND list=?", addressObj.Address, list)
+	_, err = gDB.Exec("DELETE FROM subscriptions WHERE user=? AND list=?", addressObj.Address, list)
 	if err != nil {
 		log.Printf("DATABASE_ERROR Error=%q\n", err.Error())
 		os.Exit(0)
@@ -517,77 +481,16 @@ func removeSubscription(user string, list string) {
 
 // Remove all subscriptions from a given mailing list
 func clearSubscriptions(list string) {
-	db := requireDB()
-	_, err := db.Exec("DELETE FROM subscriptions WHERE AND list=?", list)
+	_, err := gDB.Exec("DELETE FROM subscriptions WHERE AND list=?", list)
 	if err != nil {
 		log.Printf("DATABASE_ERROR Error=%q\n", err.Error())
 		os.Exit(0)
 	}
 }
 
-// HELPER FUNCTIONS ///////////////////////////////////////////////////////////
-
-// Open the log file for logging
-func openLog() error {
-	logFile, err := os.OpenFile(gConfig.Log, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0644)
-	if err != nil {
-		return err
-	}
-	out := io.MultiWriter(logFile, os.Stderr)
-	log.SetOutput(out)
-	return nil
-}
-
-// Open the log, or fail immediately
-func requireLog() {
-	err := openLog()
-	if err != nil {
-		log.Printf("LOG_ERROR Error=%q\n", err.Error())
-		os.Exit(0)
-	}
-}
-
-// Load gConfig from the on-disk config file
-func loadConfig() {
-	var (
-		err error
-		cfg *ini.File
-	)
-
-	if len(gConfig.ConfigFile) > 0 {
-		cfg, err = ini.Load(gConfig.ConfigFile)
-	} else {
-		cfg, err = ini.LooseLoad("nanolist.ini", "/usr/local/etc/nanolist.ini", "/etc/nanolist.ini")
-	}
-
-	if err != nil {
-		log.Printf("CONFIG_ERROR Error=%q\n", err.Error())
-		os.Exit(0)
-	}
-
-	err = cfg.Section("").MapTo(gConfig)
-	if err != nil {
-		log.Printf("CONFIG_ERROR Error=%q\n", err.Error())
-		os.Exit(0)
-	}
-
-	gConfig.Lists = make(map[string]*List)
-
-	for _, section := range cfg.ChildSections("list") {
-		list := &List{}
-		err = section.MapTo(list)
-		if err != nil {
-			log.Printf("CONFIG_ERROR Error=%q\n", err.Error())
-			os.Exit(0)
-		}
-		list.Id = strings.TrimPrefix(section.Name(), "list.")
-		gConfig.Lists[list.Address] = list
-	}
-}
-
 // Retrieve a list of mailing lists that are recipients of the given message
-func lookupLists(msg *Message) []*List {
-	lists := []*List{}
+func lookupLists(msg *Message) []*config.List {
+	lists := []*config.List{}
 
 	toList, err := mail.ParseAddressList(msg.To)
 	if err == nil {
@@ -623,7 +526,7 @@ func lookupLists(msg *Message) []*List {
 }
 
 // Look up a mailing list by id or address
-func lookupList(listKey string) *List {
+func lookupList(listKey string) *config.List {
 	for _, list := range gConfig.Lists {
 		if listKey == list.Id || listKey == list.Address {
 			return list
@@ -680,34 +583,4 @@ func commandInfo() string {
 		"\r\n"+
 		"To send a command, email %s with the command as the subject.\r\n",
 		gConfig.CommandAddress)
-}
-
-// Check for a valid configuration
-func checkConfig() bool {
-	_, err := openDB()
-	if err != nil {
-		fmt.Printf("There's a problem with the database: %s\n", err.Error())
-		return false
-	}
-
-	err = openLog()
-	if err != nil {
-		fmt.Printf("There's a problem with the log: %s\n", err.Error())
-		return false
-	}
-
-	client, err := smtp.Dial(gConfig.SMTPHostname + ":" + gConfig.SMTPPort)
-	if err != nil {
-		fmt.Printf("There's a problem connecting to your SMTP server: %s\n", err.Error())
-		return false
-	}
-
-	auth := smtp.PlainAuth("", gConfig.SMTPUsername, gConfig.SMTPPassword, gConfig.SMTPHostname)
-	err = client.Auth(auth)
-	if err != nil {
-		fmt.Printf("There's a problem authenticating with your SMTP server: %s\n", err.Error())
-		return false
-	}
-
-	return true
 }
